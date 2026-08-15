@@ -1,11 +1,13 @@
 // AtomCode 桥接插件（常驻 preset 插件）。
 //
 // 能力：
-//   1. 注册模型工具 `atomcode_ask`：把消息转发给本机 AtomCode **官方二进制**
-//      的 daemon（`atomcode daemon --port 13459`）HTTP `POST /chat`（SSE）接口，
-//      等待整个回合完成并返回完整回复。provider 缺省 = AtomCode 配置默认模型
-//      （AtomGit 网关，官方二进制内置网关签名）。
-//   2. 在模型设置页注册 `ATOMCODE` 可配置提供方条目；其设置 schema 不含
+//   1. **真正的模型提供商**：注册 provider 路由 `atomcode` 的 LlmAdapter ——
+//      DeepSeek Harness 的会话模型可以选 ATOMCODE，全部模型调用经本机
+//      AtomCode 官方二进制的 daemon（`atomcode daemon --port 13459`）
+//      HTTP `POST /chat`（SSE）流式执行，返回 text/reasoning/usage/finish。
+//      provider 缺省 = AtomCode 配置默认模型（AtomGit 网关，官方二进制内置签名）。
+//   2. 注册模型工具 `atomcode_ask`：把单条消息转发给 daemon 并取回完整回复。
+//   3. 在模型设置页注册 `ATOMCODE` 可配置提供方条目；其设置 schema 不含
 //      API 密钥字段，因此界面上的密钥输入无需填写（灰置）。
 //
 // 不发布任何 Service：只消费宿主提供的 tools / llm / settings / shell / fs /
@@ -15,6 +17,7 @@ import z from 'file:///usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/
 const DEFAULT_URL = 'http://127.0.0.1:13459'
 const ATOMCODE_BIN = '/home/elaina/.local/bin/atomcode'
 const HOME = '/home/elaina'
+const ATOMCODE_MODEL = 'atomcode-default'
 
 export default {
   name: 'atomcode-bridge',
@@ -27,8 +30,16 @@ export default {
     const settings = ctx.get('settings')
     if (tools === undefined) return
 
+    function stdoutOf(result) {
+      if (!result) return ''
+      const out = result.stdout
+      if (typeof out === 'string') return out
+      if (out && typeof out.text === 'string') return out.text
+      return ''
+    }
+
     async function sh(command, timeoutMs) {
-      if (shell === undefined) return { stdout: '', exitCode: 0 }
+      if (shell === undefined) return { stdout: '' }
       let spec
       try {
         spec = shell.resolve({ command, timeoutMs })
@@ -36,11 +47,7 @@ export default {
         spec = { command, timeoutMs }
       }
       const result = await shell.run(spec)
-      const stdout = result && typeof result.stdout === 'string' ? result.stdout : ''
-      let exitCode = 0
-      if (result && typeof result.exitCode === 'number') exitCode = result.exitCode
-      else if (result && typeof result.code === 'number') exitCode = result.code
-      return { stdout, exitCode }
+      return { stdout: stdoutOf(result) }
     }
 
     function portOf(url) {
@@ -86,6 +93,195 @@ export default {
       return false
     }
 
+    function serializeConversation(options) {
+      const parts = []
+      if (typeof options.system === 'string' && options.system.trim() !== '') {
+        parts.push('[系统]\n' + options.system.trim())
+      }
+      for (const message of options.messages || []) {
+        const role = message.role === 'user' ? '用户' : message.role === 'assistant' ? '助手' : String(message.role)
+        const lines = []
+        for (const block of message.content || []) {
+          if (block.type === 'text') lines.push(block.text)
+          else if (block.type === 'tool-call') lines.push('[调用工具 ' + block.name + '] ' + block.arguments)
+          else if (block.type === 'tool-result') {
+            const text = (block.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('')
+            lines.push('[工具结果 ' + block.toolCallId + '] ' + text)
+          }
+        }
+        parts.push(role + ': ' + lines.join('\n'))
+      }
+      return parts.join('\n\n')
+    }
+
+    // daemon /chat 的流式通道：shell.start + readOutput 增量读取，逐行解析 SSE。
+    async function* streamChat(url, token, bodyB64, timeoutSecs, signal) {
+      if (shell === undefined) throw new Error('shell service unavailable')
+      const command =
+        `printf '%s' '${bodyB64}' | base64 -d | curl -s -N -m ${timeoutSecs} ` +
+        `-H 'Authorization: Bearer ${token}' -H 'Content-Type: application/json' ` +
+        `-X POST ${url}/chat --data-binary @-`
+      let spec
+      try {
+        spec = shell.resolve({ command })
+      } catch (error) {
+        spec = { command }
+      }
+      const proc = shell.start(spec)
+      let buffer = ''
+      try {
+        while (true) {
+          if (signal && signal.aborted) {
+            proc.kill()
+            throw new Error('aborted by caller')
+          }
+          const read = proc.readOutput()
+          if (typeof read.delta === 'string' && read.delta !== '') {
+            buffer += read.delta
+            let index
+            while ((index = buffer.indexOf('\n')) >= 0) {
+              const line = buffer.slice(0, index)
+              buffer = buffer.slice(index + 1)
+              const trimmed = line.trim()
+              if (!trimmed.startsWith('data:')) continue
+              const data = trimmed.slice(5).trim()
+              if (data === '') continue
+              let event
+              try { event = JSON.parse(data) } catch (error) { continue }
+              yield event
+            }
+          }
+          if (proc.status === 'running') {
+            await ctx.timeout(150)
+          } else {
+            break
+          }
+        }
+      } finally {
+        try { proc.kill() } catch (error) { /* noop */ }
+      }
+    }
+
+    // ── LlmAdapter：把 DSH 的模型调用桥接到 AtomCode daemon ─────────────────
+    if (llm !== undefined) {
+      const adapter = {
+        providerInfo(provider) {
+          return { id: provider, name: 'ATOMCODE' }
+        },
+        providerRetryPolicy() {
+          return undefined
+        },
+        async listModels(provider) {
+          return [{
+            provider,
+            id: ATOMCODE_MODEL,
+            name: 'AtomCode 默认模型',
+            description: '经由本机 AtomCode daemon（官方二进制 + 配置默认模型）',
+          }]
+        },
+        async resolveModel(provider, model) {
+          return {
+            provider,
+            id: model,
+            name: model === ATOMCODE_MODEL ? 'AtomCode 默认模型' : String(model),
+            context: { contextWindow: 128000 },
+            defaultMaxTokens: 32000,
+          }
+        },
+        async *stream(options) {
+          const url = DEFAULT_URL.replace(/\/+$/, '')
+          const timeoutSecs = 600
+          if (!(await ensureDaemon(url))) {
+            throw new Error('AtomCode daemon 不可用: ' + url)
+          }
+          const token = await tokenFor(url)
+          const payload = {
+            message: serializeConversation(options),
+            approval_mode: 'bypass',
+          }
+          const bodyB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
+          let textBlock = null
+          let reasoningBlock = null
+          let blockIndex = 0
+          let pendingUsage = null
+          const open = (type) => ({ index: blockIndex++, type, text: '' })
+          for await (const event of streamChat(url, token, bodyB64, timeoutSecs, options.signal)) {
+            const type = event && event.type
+            if (type === 'text' && typeof event.content === 'string') {
+              if (textBlock === null) {
+                textBlock = open('text')
+                yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
+              }
+              textBlock.text += event.content
+              yield { type: 'text-delta', index: textBlock.index, text: event.content }
+            } else if (type === 'reasoning' && typeof event.content === 'string') {
+              if (reasoningBlock === null) {
+                reasoningBlock = open('reasoning')
+                yield { type: 'block-start', index: reasoningBlock.index, blockType: 'reasoning' }
+              }
+              reasoningBlock.text += event.content
+              yield { type: 'reasoning-delta', index: reasoningBlock.index, text: event.content }
+            } else if (type === 'tokens') {
+              pendingUsage = {
+                inputTokens: Number(event.prompt) || 0,
+                outputTokens: Number(event.completion) || 0,
+              }
+            } else if (type === 'error') {
+              throw new Error(String(event.message || 'AtomCode 回合错误'))
+            } else if (type === 'done') {
+              if (textBlock === null) {
+                textBlock = open('text')
+                yield { type: 'block-start', index: textBlock.index, blockType: 'text' }
+              }
+              if (reasoningBlock !== null) {
+                yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+              }
+              yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+              yield { type: 'usage', usage: pendingUsage || { inputTokens: 0, outputTokens: 0 } }
+              yield { type: 'finish', reason: { kind: 'stop' } }
+              return
+            }
+          }
+          throw new Error('AtomCode SSE 流在 done 之前结束')
+        },
+      }
+      try {
+        const disposeAdapter = llm.registerAdapter(['atomcode'], adapter)
+        ctx.effect(() => disposeAdapter)
+      } catch (error) {
+        ctx.logger?.warn('[atomcode-bridge] adapter route already registered:', String(error))
+      }
+    }
+
+    // ATOMCODE 可配置提供方目录条目：模型设置页由此渲染该行。
+    // llm 目录是进程级注册表：多个会话同时挂载本 preset 时重复注册会抛错，
+    // 幂等跳过即可（首个会话的注册随其 fiber 存活，闭会话后消失）。
+    if (llm !== undefined) {
+      try {
+        const disposeDir = llm.registerConfigurableProviders([{
+          provider: 'atomcode',
+          displayName: 'ATOMCODE',
+          settingsNs: 'llm-atomcode',
+          settingsPath: [],
+          declared: true,
+        }])
+        ctx.effect(() => () => disposeDir())
+      } catch (error) {
+        ctx.logger?.warn('[atomcode-bridge] provider directory entry already registered:', String(error))
+      }
+    }
+
+    // ATOMCODE 的设置 section：schema 刻意不含 apiKey 字段，界面密钥输入灰置。
+    // settings 同为进程级注册表，重复注册幂等跳过。
+    if (settings !== undefined) {
+      try {
+        settings.register('llm-atomcode', z.object({}), { base: {} })
+      } catch (error) {
+        ctx.logger?.warn('[atomcode-bridge] settings namespace already registered:', String(error))
+      }
+    }
+
+    // ── atomcode_ask 模型工具 ───────────────────────────────────────────────
     async function askAtomcode(args) {
       const url = (typeof args.daemon_url === 'string' && args.daemon_url.trim() !== ''
         ? args.daemon_url.trim() : DEFAULT_URL).replace(/\/+$/, '')
@@ -105,18 +301,9 @@ export default {
       if (typeof args.session_id === 'string' && args.session_id !== '') payload.session_id = args.session_id
       if (typeof args.working_dir === 'string' && args.working_dir !== '') payload.working_dir = args.working_dir
       const bodyB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
-      const command =
-        `printf '%s' '${bodyB64}' | base64 -d | curl -s -N -m ${timeoutSecs} ` +
-        `-H 'Authorization: Bearer ${token}' -H 'Content-Type: application/json' ` +
-        `-X POST ${url}/chat --data-binary @-`
-      const run = await sh(command, (timeoutSecs + 30) * 1000)
       const events = []
-      for (const line of run.stdout.split(/\r?\n/)) {
-        const trimmed = line.trim()
-        if (!trimmed.startsWith('data:')) continue
-        const data = trimmed.slice(5).trim()
-        if (data === '') continue
-        try { events.push(JSON.parse(data)) } catch (error) { /* 跳过非 JSON 行 */ }
+      for await (const event of streamChat(url, token, bodyB64, timeoutSecs, undefined)) {
+        events.push(event)
       }
       let reply = ''
       const usedTools = []
@@ -207,33 +394,5 @@ export default {
       },
     })
     ctx.effect(() => disposeTool)
-
-    // ATOMCODE 可配置提供方目录条目：模型设置页由此渲染该行。
-    // llm 目录是进程级注册表：多个会话同时挂载本 preset 时重复注册会抛错，
-    // 幂等跳过即可（首个会话的注册随其 fiber 存活，闭会话后消失）。
-    if (llm !== undefined) {
-      try {
-        const disposeDir = llm.registerConfigurableProviders([{
-          provider: 'atomcode',
-          displayName: 'ATOMCODE',
-          settingsNs: 'llm-atomcode',
-          settingsPath: [],
-          declared: true,
-        }])
-        ctx.effect(() => () => disposeDir())
-      } catch (error) {
-        ctx.logger?.warn('[atomcode-bridge] provider directory entry already registered:', String(error))
-      }
-    }
-
-    // ATOMCODE 的设置 section：schema 刻意不含 apiKey 字段，界面密钥输入灰置。
-    // settings 同为进程级注册表，重复注册幂等跳过。
-    if (settings !== undefined) {
-      try {
-        settings.register('llm-atomcode', z.object({}), { base: {} })
-      } catch (error) {
-        ctx.logger?.warn('[atomcode-bridge] settings namespace already registered:', String(error))
-      }
-    }
   },
 }
