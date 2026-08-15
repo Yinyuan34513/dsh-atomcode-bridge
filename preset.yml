@@ -1,0 +1,2 @@
+name: AtomCode 桥接
+description: 在创造模式全部能力之上增加 AtomCode 桥接：注册 atomcode_ask 工具，把消息转发给本机 AtomCode daemon 的 HTTP /chat 接口并取回完整回复；同时在模型设置页注册 ATOMCODE 提供方条目（无需 API 密钥）。
