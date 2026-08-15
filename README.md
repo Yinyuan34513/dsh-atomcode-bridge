@@ -51,6 +51,12 @@ cp -r <本仓库> ~/.dsh/.agent-presets/atomcode
 
 AI 会调用 `atomcode_ask` 把这句话转发给 daemon，取回完整回复后转达。
 
+## 主题包
+
+`theme/` 目录是一个独立的 **AtomCode Web UI 主题包**：把 DSH Web GUI 的配色做成
+AtomCode 的陶土橙 + 暖象牙白/暖炭黑（保留左上角 logo、不改模型列表）。
+详见 [theme/README.md](theme/README.md)。
+
 ## 结构
 
 ```
@@ -58,6 +64,7 @@ agent.cordis.yml          # preset 组合（cordis 预设副本 + plugin-atomcod
 preset.yml                # 显示名与描述
 plugins/atomcode-bridge.mjs  # 插件本体（LlmAdapter + atomcode_ask + ATOMCODE 提供方条目）
 skills/                   # 随 preset 分发的创作技能（自引用工具集需要）
+theme/                    # AtomCode Web UI 主题包（atomcode-theme.js + 说明）
 ```
 
 ## 许可
