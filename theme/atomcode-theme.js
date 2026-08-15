@@ -6,8 +6,8 @@
 //   浅色 = 暖象牙白 #faf9f5 / #f0eee6 / #ffffff，前景 #1f1e1d / #6b6a63
 //   成功 #74c991 · 错误 #f14c4c · 警告 #e5a54b
 //
-// 用法：在 DeepSeek Harness 里用 cordis_define 把本文件内容作为 code.client
-// 定义并 cordis_run；批准后主题出现在「外观」里（AtomCode / AtomCode Light）。
+// 用法：把本文件内容作为 code.client 用 cordis_define 定义并 cordis_run；
+// 批准后主题立即叠加生效（自动跟随“浅色/深色/跟随系统”），无需去外观设置里找。
 // 只覆盖颜色 token 与字体/滚动条样式 —— 不碰左上角 logo、不碰模型列表。
 return {
   name: 'atomcode-theme',
@@ -46,10 +46,20 @@ return {
       '--dsw-specific-sidebar-fill': '#f0eee6',
     }
 
+    // 立即叠加生效：深浅两套值都有，自动跟随当前“浅色/深色/系统”。
+    const OVERRIDES = {}
+    for (const key of Object.keys(DARK)) {
+      OVERRIDES[key] = { light: LIGHT[key], dark: DARK[key] }
+    }
+    const disposeOverride = theme.overrideTokens('atomcode-theme', OVERRIDES)
+    ctx.effect(() => disposeOverride)
+
+    // 同时注册可选项（供主题快照/未来选择器使用；当前外观行不展示第三方主题）。
     const disposeDark = theme.register({ id: 'atomcode-dark', colorScheme: 'dark', tokens: DARK })
     const disposeLight = theme.register({ id: 'atomcode-light', colorScheme: 'light', tokens: LIGHT })
     ctx.effect(() => { disposeDark(); disposeLight() })
 
+    // 字体栈 + 细滚动条 + clay 选区：纯增量样式，不碰 logo 与模型列表。
     const slots = ctx.get('slots')
     if (slots !== undefined) {
       const CSS = [
